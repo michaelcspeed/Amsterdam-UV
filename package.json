@@ -1,0 +1,18 @@
+{
+  "name": "amsterdam-uv-bot",
+  "version": "1.0.0",
+  "description": "Cloudflare Worker that sends daily UV index reports for Amsterdam to Telegram",
+  "main": "src/index.ts",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20240208.0",
+    "typescript": "^5.3.3",
+    "wrangler": "^4.10.0"
+  }
+}

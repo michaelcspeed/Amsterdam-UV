@@ -1,0 +1,14 @@
+name = "amsterdam-uv-index-bot"
+main = "src/index.ts"
+compatibility_date = "2024-01-01"
+
+[triggers]
+crons = ["48 8 * * *"] # Runs daily at 9:48 UTC (10:48 Amsterdam time)
+
+# Environment variables are now loaded from .env file
+# The following variables are required:
+# - TELEGRAM_BOT_TOKEN
+# - CHAT_ID
+# - OPENUV_API_KEY
+# - LATITUDE
+# - LONGITUDE 
