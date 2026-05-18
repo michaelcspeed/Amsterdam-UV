@@ -3,7 +3,20 @@ main = "src/index.ts"
 compatibility_date = "2024-01-01"
 
 [triggers]
-crons = ["48 8 * * *"] # Runs daily at 9:48 UTC (10:48 Amsterdam time)
+crons = ["0 5 * * *", "*/15 * * * *"] # UV report at 7:00 Amsterdam time (5:00 UTC), rain check every 15 min all day
+
+[[kv_namespaces]]
+binding = "RAIN_STATE"
+id = "6a9f81f79f614f49b9f6832cdaf073ee"
+
+[[kv_namespaces]]
+binding = "WIND_STATE"
+id = "517f0af0d3394c199df0b8b350e5d396"
+
+[[kv_namespaces]]
+binding = "ALERT_STATE"
+id = "687ada18489146d7bb05cc8db295dbb3"
+
 
 # Environment variables are now loaded from .env file
 # The following variables are required:
@@ -11,4 +24,5 @@ crons = ["48 8 * * *"] # Runs daily at 9:48 UTC (10:48 Amsterdam time)
 # - CHAT_ID
 # - OPENUV_API_KEY
 # - LATITUDE
-# - LONGITUDE 
+# - LONGITUDE
+# - GOOGLE_WEATHER_API_KEY
