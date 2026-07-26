@@ -3,7 +3,10 @@ main = "src/index.ts"
 compatibility_date = "2024-01-01"
 
 [triggers]
-crons = ["0 5 * * *", "*/15 * * * *"] # UV report at 7:00 Amsterdam time (5:00 UTC), rain check every 15 min all day
+# Morning briefing at 7:00 Amsterdam (5:00 UTC) — full Google + OpenUV.
+# Rain + wind via Open-Meteo (free) every 5 min.
+# Google publicAlerts every 30 min — keeps Google usage well under 10K/month free tier.
+crons = ["0 5 * * *", "*/5 * * * *", "*/30 * * * *"]
 
 [[kv_namespaces]]
 binding = "RAIN_STATE"

@@ -2,6 +2,7 @@
 
 interface Env {
   TELEGRAM_BOT_TOKEN: string;
+  TELEGRAM_WEBHOOK_SECRET: string;
   CHAT_ID: string;
   OPENUV_API_KEY: string;
   GOOGLE_WEATHER_API_KEY: string;
@@ -24,12 +25,12 @@ interface DailyUV {
     };
   };
   safe_exposure_time: {
-    st1: number;
-    st2: number;
-    st3: number;
-    st4: number;
-    st5: number;
-    st6: number;
+    st1: number | null;
+    st2: number | null;
+    st3: number | null;
+    st4: number | null;
+    st5: number | null;
+    st6: number | null;
   };
 }
 
@@ -51,7 +52,22 @@ interface OpenMeteoResponse {
     time: string[];
     precipitation_probability: number[];
     precipitation: number[];
+    weathercode: number[];
+    windspeed_10m: number[];
+    windgusts_10m: number[];
+    temperature_2m: number[];
+    apparent_temperature: number[];
   };
+}
+
+interface WeatherSnapshot {
+  probability: number;
+  mm: number;
+  weatherCode: number;
+  windSpeedKmh: number;
+  windGustKmh: number;
+  tempC: number;
+  feelsLikeC: number;
 }
 
 interface GoogleHourEntry {
@@ -135,12 +151,46 @@ function formatTimeDelta(minutesDelta: number): string {
   return m === 0 ? `${sign}${h} hr` : `${sign}${h} hr ${m} min`;
 }
 
+// Escape user/API-provided text for Telegram HTML parse mode.
+function escapeHtml(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
 // ─── API calls ──────────────────────────────────────────────────────────────
 
 
-async function getDailyUV(env: Env): Promise<DailyUV> {
+interface Coords {
+  lat: string;
+  lng: string;
+  custom: boolean;
+}
+
+const CUSTOM_LOCATION_KEY = 'custom_location';
+
+async function getActiveCoords(env: Env): Promise<Coords> {
+  const stored = await env.ALERT_STATE.get(CUSTOM_LOCATION_KEY);
+  if (stored) {
+    const { lat, lng } = JSON.parse(stored) as { lat: number; lng: number };
+    return { lat: String(lat), lng: String(lng), custom: true };
+  }
+  return { lat: env.LATITUDE, lng: env.LONGITUDE, custom: false };
+}
+
+// "📍 Custom location (…)" banner for messages sent while a custom location is set.
+function locationTag(coords: Coords): string {
+  return coords.custom
+    ? `📍 <i>Custom location (${Number(coords.lat).toFixed(3)}, ${Number(coords.lng).toFixed(3)})</i>\n\n`
+    : '';
+}
+
+// "Amsterdam" or "custom location" for use inside sentences/titles.
+function placeName(coords: Coords): string {
+  return coords.custom ? 'custom location' : 'Amsterdam';
+}
+
+async function getDailyUV(env: Env, coords: Coords): Promise<DailyUV> {
   const url = 'https://api.openuv.io/api/v1/uv';
-  const params = new URLSearchParams({ lat: env.LATITUDE, lng: env.LONGITUDE, alt: '0' });
+  const params = new URLSearchParams({ lat: coords.lat, lng: coords.lng, alt: '0' });
   const response = await fetch(`${url}?${params}`, {
     headers: { 'x-access-token': env.OPENUV_API_KEY },
   });
@@ -148,9 +198,9 @@ async function getDailyUV(env: Env): Promise<DailyUV> {
   return data.result;
 }
 
-async function getUVForecast(env: Env): Promise<UVForecastEntry[]> {
+async function getUVForecast(env: Env, coords: Coords): Promise<UVForecastEntry[]> {
   const url = 'https://api.openuv.io/api/v1/forecast';
-  const params = new URLSearchParams({ lat: env.LATITUDE, lng: env.LONGITUDE, alt: '0' });
+  const params = new URLSearchParams({ lat: coords.lat, lng: coords.lng, alt: '0' });
   const response = await fetch(`${url}?${params}`, {
     headers: { 'x-access-token': env.OPENUV_API_KEY },
   });
@@ -181,61 +231,80 @@ class GoogleAPIError extends Error {}
 async function googleFetch(url: string, params: URLSearchParams, env: Env): Promise<unknown> {
   const response = await fetch(`${url}?${params}`);
   if (response.status === 429) {
-    await sendTelegramMessage(`⚠️ *Google Weather API quota reached*\n\nDaily limit hit — weather data unavailable until tomorrow.`, env);
+    await sendTelegramMessage(`⚠️ <b>Google Weather API quota reached</b>\n\nDaily limit hit — weather data unavailable until tomorrow.`, env);
     throw new GoogleQuotaError('Google Weather API quota exceeded');
   }
   if (!response.ok) {
-    await sendTelegramMessage(`⚠️ *Google Weather API error*\n\nRequest returned HTTP ${response.status} — some weather data may be unavailable.`, env);
+    await sendTelegramMessage(`⚠️ <b>Google Weather API error</b>\n\nRequest returned HTTP ${response.status} — some weather data may be unavailable.`, env);
     throw new GoogleAPIError(`Google Weather API returned ${response.status}`);
   }
   return response.json();
 }
 
-async function getHourlyWeather(env: Env): Promise<GoogleHourlyResponse> {
+async function getHourlyWeather(env: Env, coords: Coords): Promise<GoogleHourlyResponse> {
   const url = 'https://weather.googleapis.com/v1/forecast/hours:lookup';
   const params = new URLSearchParams({
     key: env.GOOGLE_WEATHER_API_KEY,
-    'location.latitude': env.LATITUDE,
-    'location.longitude': env.LONGITUDE,
+    'location.latitude': coords.lat,
+    'location.longitude': coords.lng,
     hours: '24',
   });
   return googleFetch(url, params, env) as Promise<GoogleHourlyResponse>;
 }
 
-async function getDaysWeather(env: Env, days = 2): Promise<GoogleDaysResponse> {
+async function getDaysWeather(env: Env, coords: Coords, days = 2): Promise<GoogleDaysResponse> {
   const url = 'https://weather.googleapis.com/v1/forecast/days:lookup';
   const params = new URLSearchParams({
     key: env.GOOGLE_WEATHER_API_KEY,
-    'location.latitude': env.LATITUDE,
-    'location.longitude': env.LONGITUDE,
+    'location.latitude': coords.lat,
+    'location.longitude': coords.lng,
     days: String(days),
   });
   return googleFetch(url, params, env) as Promise<GoogleDaysResponse>;
 }
 
-async function getWeatherAlerts(env: Env): Promise<WeatherAlert[]> {
+async function getWeatherAlerts(env: Env, coords: Coords): Promise<WeatherAlert[]> {
   const url = 'https://weather.googleapis.com/v1/publicAlerts:lookup';
   const params = new URLSearchParams({
     key: env.GOOGLE_WEATHER_API_KEY,
-    'location.latitude': env.LATITUDE,
-    'location.longitude': env.LONGITUDE,
+    'location.latitude': coords.lat,
+    'location.longitude': coords.lng,
     languageCode: 'en',
   });
   const data = await googleFetch(url, params, env) as WeatherAlertsResponse;
   return data.weatherAlerts ?? [];
 }
 
-async function sendTelegramMessage(message: string, env: Env): Promise<Response> {
+// Persistent reply keyboard: location-request button + reset button.
+const LOCATION_KEYBOARD = {
+  keyboard: [[
+    { text: '📍 Set current location', request_location: true },
+    { text: '🏠 Reset to Amsterdam' },
+  ]],
+  resize_keyboard: true,
+  is_persistent: true,
+};
+
+async function sendTelegramMessage(message: string, env: Env, withKeyboard = false): Promise<Response> {
   const url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`;
-  const res = await fetch(url, {
+  const post = (text: string) => fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       chat_id: env.CHAT_ID,
-      text: message,
-      parse_mode: 'Markdown',
+      text,
+      parse_mode: 'HTML',
+      ...(withKeyboard ? { reply_markup: LOCATION_KEYBOARD } : {}),
     }),
   });
+
+  const res = await post(message);
+  // Telegram documents that `pre` "cannot be combined with any other format", and
+  // it's unspecified whether a <pre> chart nested in <blockquote expandable> parses.
+  // If it doesn't, lose the collapse rather than the whole briefing.
+  if (!res.ok && message.includes('<blockquote')) {
+    return post(message.replace(/<\/?blockquote(?: expandable)?>/g, ''));
+  }
   return res;
 }
 
@@ -303,12 +372,48 @@ function precipTypeLabel(type: string): { label: string; emoji: string } {
   }
 }
 
+// WMO weather interpretation codes (Open-Meteo) → display + precip labels.
+const WMO_META: Record<number, { condLabel: string; condEmoji: string; precipLabel: string; precipEmoji: string }> = {
+  0:  { condLabel: 'clear skies',            condEmoji: '☀️',  precipLabel: 'Precipitation',    precipEmoji: '🌧️' },
+  1:  { condLabel: 'mainly clear',           condEmoji: '🌤️', precipLabel: 'Precipitation',    precipEmoji: '🌧️' },
+  2:  { condLabel: 'partly cloudy',          condEmoji: '⛅',  precipLabel: 'Precipitation',    precipEmoji: '🌧️' },
+  3:  { condLabel: 'overcast',               condEmoji: '☁️',  precipLabel: 'Precipitation',    precipEmoji: '🌧️' },
+  45: { condLabel: 'fog',                    condEmoji: '🌫️', precipLabel: 'Precipitation',    precipEmoji: '🌧️' },
+  48: { condLabel: 'freezing fog',           condEmoji: '🌫️', precipLabel: 'Precipitation',    precipEmoji: '🌧️' },
+  51: { condLabel: 'light drizzle',          condEmoji: '🌦️', precipLabel: 'Light drizzle',    precipEmoji: '🌦️' },
+  53: { condLabel: 'drizzle',                condEmoji: '🌦️', precipLabel: 'Drizzle',          precipEmoji: '🌦️' },
+  55: { condLabel: 'dense drizzle',          condEmoji: '🌧️', precipLabel: 'Dense drizzle',    precipEmoji: '🌧️' },
+  56: { condLabel: 'freezing drizzle',       condEmoji: '🧊',  precipLabel: 'Freezing drizzle', precipEmoji: '🧊'  },
+  57: { condLabel: 'dense freezing drizzle', condEmoji: '🧊',  precipLabel: 'Freezing drizzle', precipEmoji: '🧊'  },
+  61: { condLabel: 'light rain',             condEmoji: '🌦️', precipLabel: 'Light rain',       precipEmoji: '🌦️' },
+  63: { condLabel: 'rain',                   condEmoji: '🌧️', precipLabel: 'Rain',             precipEmoji: '🌧️' },
+  65: { condLabel: 'heavy rain',             condEmoji: '🌧️', precipLabel: 'Heavy rain',       precipEmoji: '🌧️' },
+  66: { condLabel: 'freezing rain',          condEmoji: '🧊',  precipLabel: 'Freezing rain',    precipEmoji: '🧊'  },
+  67: { condLabel: 'heavy freezing rain',    condEmoji: '🧊',  precipLabel: 'Freezing rain',    precipEmoji: '🧊'  },
+  71: { condLabel: 'light snow',             condEmoji: '🌨️', precipLabel: 'Light snow',       precipEmoji: '🌨️' },
+  73: { condLabel: 'snow',                   condEmoji: '🌨️', precipLabel: 'Snow',             precipEmoji: '🌨️' },
+  75: { condLabel: 'heavy snow',             condEmoji: '❄️',  precipLabel: 'Heavy snow',       precipEmoji: '❄️'  },
+  77: { condLabel: 'snow grains',            condEmoji: '🌨️', precipLabel: 'Snow grains',      precipEmoji: '🌨️' },
+  80: { condLabel: 'light rain showers',     condEmoji: '🌦️', precipLabel: 'Light showers',    precipEmoji: '🌦️' },
+  81: { condLabel: 'rain showers',           condEmoji: '🌦️', precipLabel: 'Showers',          precipEmoji: '🌦️' },
+  82: { condLabel: 'violent rain showers',   condEmoji: '🌧️', precipLabel: 'Heavy showers',    precipEmoji: '🌧️' },
+  85: { condLabel: 'light snow showers',     condEmoji: '🌨️', precipLabel: 'Snow showers',     precipEmoji: '🌨️' },
+  86: { condLabel: 'heavy snow showers',     condEmoji: '❄️',  precipLabel: 'Heavy snow',       precipEmoji: '❄️'  },
+  95: { condLabel: 'thunderstorm',           condEmoji: '⛈️',  precipLabel: 'Thunderstorm',     precipEmoji: '⛈️'  },
+  96: { condLabel: 'thunderstorm with hail', condEmoji: '⛈️',  precipLabel: 'Thunderstorm',     precipEmoji: '⛈️'  },
+  99: { condLabel: 'severe thunderstorm',    condEmoji: '⛈️',  precipLabel: 'Thunderstorm',     precipEmoji: '⛈️'  },
+};
+
+function wmoMeta(code: number) {
+  return WMO_META[code] ?? { condLabel: 'mixed conditions', condEmoji: '🌡️', precipLabel: 'Precipitation', precipEmoji: '🌧️' };
+}
+
 function windDescriptor(speedKmh: number): string {
-  if (speedKmh < 12) return 'light winds';
-  if (speedKmh < 29) return 'moderate winds';
-  if (speedKmh < 50) return 'strong winds';
-  if (speedKmh < 75) return 'very strong winds';
-  return 'storm-force winds';
+  if (speedKmh < 12) return 'light';
+  if (speedKmh < 29) return 'moderate';
+  if (speedKmh < 50) return 'strong';
+  if (speedKmh < 75) return 'very strong';
+  return 'storm-force';
 }
 
 // ─── Clothing recommendation ─────────────────────────────────────────────────
@@ -330,13 +435,13 @@ function clothingHeadline(
 
   let garment: string;
   if (feelsLikeMinDaylight >= 18) {
-    garment = wet ? '👕 *T-shirt* + 🧥 rain jacket' : '👕 *T-shirt*';
+    garment = wet ? '👕 T-shirt + 🧥 rain jacket' : '👕 T-shirt';
   } else if (feelsLikeMinDaylight >= 12) {
-    garment = wet ? '🧶 *Jumper* + 🧥 rain jacket' : '🧶 *Jumper*';
+    garment = wet ? '🧶 Jumper + 🧥 rain jacket' : '🧶 Jumper';
   } else if (feelsLikeMinDaylight >= 5) {
-    garment = wet ? '🧥 *Warm jacket* + 🧥 rain jacket' : '🧥 *Warm jacket*';
+    garment = wet ? '🧥 Warm jacket + 🧥 rain jacket' : '🧥 Warm jacket';
   } else {
-    garment = '🧥 *Warm jacket* + 🧣 scarf';
+    garment = '🧥 Warm jacket + 🧣 scarf';
   }
 
   const suffix = wet && windy ? ' (windproof recommended)' : '';
@@ -345,14 +450,61 @@ function clothingHeadline(
   return `${garment} · ${Math.round(tempMin)}–${Math.round(tempMax)}°${suffix}${windyTag}`;
 }
 
+// ─── Rain chart ──────────────────────────────────────────────────────────────
+
+const RAIN_BAR_WIDTH = 12;
+// A full bar means 1 mm/hr (light-to-moderate rain) unless the day is wetter than
+// that, so Dutch drizzle reads as drizzle instead of filling the chart every time.
+const RAIN_BAR_MIN_SCALE_MM = 1;
+// Google's qpf granularity is 0.1mm; below this an hour is dry for display purposes.
+const RAIN_DRY_MM = 0.05;
+
+interface RainHour {
+  hour: number;
+  mm: number;
+  prob: number;
+}
+
+// The hourly endpoint returns a rolling 24h, so cut at the midnight wrap to get
+// "the rest of today". Late-evening on-demand reports would be left with a one-
+// or two-row chart, so fall back to a flat next-6-hours window.
+function todaysRainHours(hourly: GoogleHourlyResponse): RainHour[] {
+  const all: RainHour[] = hourly.forecastHours.map(entry => ({
+    hour: entry.displayDateTime.hours,
+    mm: entry.precipitation.qpf.quantity,
+    prob: entry.precipitation.probability.percent,
+  }));
+  const wrap = all.findIndex((row, i) => i > 0 && row.hour < all[i - 1].hour);
+  const today = wrap === -1 ? all : all.slice(0, wrap);
+  return today.length >= 6 ? today : all.slice(0, 6);
+}
+
+// brolly.sh-style hourly rainfall chart, collapsed behind an expandable blockquote.
+// Null when nothing is forecast to fall — the summary line already covers that.
+function buildRainChart(rows: RainHour[]): string | null {
+  const peakMm = Math.max(...rows.map(r => r.mm));
+  if (peakMm < RAIN_DRY_MM) return null;
+
+  const scale = Math.max(peakMm, RAIN_BAR_MIN_SCALE_MM);
+  const lines = [`hr ${'rainfall'.padEnd(RAIN_BAR_WIDTH)} ${'mm'.padStart(4)} prob`];
+  for (const r of rows) {
+    const wet = r.mm >= RAIN_DRY_MM;
+    // Any measurable rain gets at least one block, so a wet hour never looks dry.
+    const bar = wet ? '█'.repeat(Math.max(1, Math.round((r.mm / scale) * RAIN_BAR_WIDTH))) : '';
+    const mm = !wet ? '·' : r.mm >= 10 ? String(Math.round(r.mm)) : r.mm.toFixed(1);
+    lines.push(
+      `${String(r.hour).padStart(2, '0')} ${bar.padEnd(RAIN_BAR_WIDTH)} ${mm.padStart(4)} ${String(r.prob).padStart(3)}%`,
+    );
+  }
+  return `<blockquote expandable><pre>${lines.join('\n')}</pre></blockquote>`;
+}
+
 // ─── Weather block builder ───────────────────────────────────────────────────
 
 function buildWeatherBlock(
   hourly: GoogleHourlyResponse,
   today: GoogleDayEntry,
-  sunDeltas: { sunrise: number; sunset: number },
-  dailyUV: DailyUV,
-  uvForecast: UVForecastEntry[],
+  sunDeltas: { sunrise: number; sunset: number } | null,
 ): string {
   // Rain: peak probability across daylight hours
   let maxRainProb = 0;
@@ -363,20 +515,19 @@ function buildWeatherBlock(
     const prob = entry.precipitation.probability.percent;
     if (prob > maxRainProb) { maxRainProb = prob; maxRainHour = h; }
   }
-  const rainLine = maxRainProb >= 20
-    ? `🌧️ Rain: up to ${maxRainProb}% chance (peaks around ${String(maxRainHour).padStart(2, '0')}:00)`
-    : `🌂 no rain expected`;
+  const rainRows = todaysRainHours(hourly);
+  const rainChart = buildRainChart(rainRows);
 
-  // UV: 9am · peak · 5pm
-  const maxUV = dailyUV.uv_max;
-  const maxUVTime = formatTime(dailyUV.uv_max_time);
-  const uv9 = uvAtHour(uvForecast, 9);
-  const uv17 = uvAtHour(uvForecast, 17);
-  const uvParts: string[] = [];
-  if (uv9 !== null) uvParts.push(`${uv9.toFixed(1)} (09:00)`);
-  uvParts.push(`${maxUV.toFixed(1)} peak @ ${maxUVTime}`);
-  if (uv17 !== null) uvParts.push(`${uv17.toFixed(1)} (17:00)`);
-  const uvLine = `☀️ UV: ${uvParts.join(' · ')}`;
+  let rainLine: string;
+  if (rainChart) {
+    const totalMm = rainRows.reduce((sum, r) => sum + r.mm, 0);
+    const heaviest = rainRows.reduce((a, b) => (b.mm > a.mm ? b : a));
+    rainLine = `🌧️ up to <b>${maxRainProb}%</b> chance · <b>${totalMm.toFixed(1)}mm</b> <i>(heaviest ${String(heaviest.hour).padStart(2, '0')}:00)</i>`;
+  } else if (maxRainProb >= 20) {
+    rainLine = `🌧️ up to <b>${maxRainProb}%</b> chance <i>(peaks around ${String(maxRainHour).padStart(2, '0')}:00)</i>`;
+  } else {
+    rainLine = `🌂 <i>no rain expected</i>`;
+  }
 
   // Temp — actual min/max from hourly + daylight feels-like min for clothing
   let minTemp = Infinity, maxTemp = -Infinity, minHour = 0, maxHour = 0;
@@ -393,42 +544,104 @@ function buildWeatherBlock(
   }
   const feelsHigh = Math.round(today.feelsLikeMaxTemperature.degrees);
   const feelsLow = Math.round(today.feelsLikeMinTemperature.degrees);
-  const tempLine = `🌡️ ${Math.round(minTemp)}° (${String(minHour).padStart(2, '0')}:00) → ${Math.round(maxTemp)}° (${String(maxHour).padStart(2, '0')}:00), feels ${feelsLow}–${feelsHigh}°`;
+  const tempLine = `🌡️ <b>${Math.round(minTemp)}°</b> (${String(minHour).padStart(2, '0')}:00) → <b>${Math.round(maxTemp)}°</b> (${String(maxHour).padStart(2, '0')}:00), <i>feels ${feelsLow}–${feelsHigh}°</i>`;
 
   // Wind
   const wind = today.daytimeForecast.wind;
   const gustKmh = Math.round(wind.gust.value);
-  const windLine = `💨 ${windDescriptor(Math.round(wind.speed.value))}${gustKmh >= 40 ? `, gusts ${gustKmh} km/h` : ''}`;
-
-  // Sun (deltas hidden when |Δ| < 2)
-  const sunriseStr = formatTime(today.sunEvents.sunriseTime);
-  const sunsetStr = formatTime(today.sunEvents.sunsetTime);
-  const sunriseDelta = Math.abs(sunDeltas.sunrise) >= 2 ? ` (${formatTimeDelta(sunDeltas.sunrise)})` : '';
-  const sunsetDelta = Math.abs(sunDeltas.sunset) >= 2 ? ` (${formatTimeDelta(sunDeltas.sunset)})` : '';
-  const sunLine = `🌅 ${sunriseStr}${sunriseDelta}  🌇 ${sunsetStr}${sunsetDelta}`;
+  const windLine = `💨 <b>${windDescriptor(Math.round(wind.speed.value))}</b>${gustKmh >= 40 ? ` <i>· gusts ${gustKmh} km/h</i>` : ''}`;
 
   const headline = clothingHeadline(feelsLikeMinDaylight, maxRainProb, gustKmh, minTemp, maxTemp);
 
-  return [
-    headline,
+  const lines = [
+    `<b>${headline}</b>`,
     '',
     tempLine,
-    uvLine,
     windLine,
     rainLine,
-    '',
-    sunLine,
-  ].join('\n');
+  ];
+
+  if (rainChart) lines.push(rainChart);
+
+  // Sun line skipped for custom locations (times would be in Amsterdam TZ).
+  if (sunDeltas) {
+    const sunriseStr = formatTime(today.sunEvents.sunriseTime);
+    const sunsetStr = formatTime(today.sunEvents.sunsetTime);
+    const sunriseDelta = Math.abs(sunDeltas.sunrise) >= 2 ? ` <i>(${formatTimeDelta(sunDeltas.sunrise)})</i>` : '';
+    const sunsetDelta = Math.abs(sunDeltas.sunset) >= 2 ? ` <i>(${formatTimeDelta(sunDeltas.sunset)})</i>` : '';
+    lines.push('', `🌅 ${sunriseStr}${sunriseDelta}  🌇 ${sunsetStr}${sunsetDelta}`);
+  }
+
+  return lines.join('\n');
 }
 
-// ─── Rain check ──────────────────────────────────────────────────────────────
+// ─── UV block builder ────────────────────────────────────────────────────────
 
-async function checkRainForecast(env: Env, forceTest = false, hourly?: GoogleHourlyResponse): Promise<void> {
+function uvCategory(uv: number): { label: string; emoji: string } {
+  if (uv < 3) return { label: 'Low', emoji: '🟩' };
+  if (uv < 6) return { label: 'Moderate', emoji: '🟨' };
+  if (uv < 8) return { label: 'High', emoji: '🟧' };
+  if (uv < 11) return { label: 'Very High', emoji: '🟥' };
+  return { label: 'Extreme', emoji: '🟪' };
+}
+
+function formatExposure(minutes: number | null): string {
+  if (minutes == null) return 'unlimited';
+  if (minutes >= 16 * 60) return 'all day';
+  const h = Math.floor(minutes / 60);
+  const m = minutes % 60;
+  if (h === 0) return `${m} min`;
+  return m === 0 ? `${h} hr` : `${h} hr ${m} min`;
+}
+
+function buildUVBlock(dailyUV: DailyUV, uvForecast: UVForecastEntry[]): string {
+  const maxUV = dailyUV.uv_max;
+  const maxUVTime = formatTime(dailyUV.uv_max_time);
+  const { label, emoji } = uvCategory(maxUV);
+  const header = `☀️ <b>Max Today: ${maxUV.toFixed(1)}</b> @ ${maxUVTime} (${label} ${emoji})`;
+
+  const chartLines = uvForecast.map(entry => {
+    const time = formatTime(entry.uv_time);
+    const bar = '█'.repeat(Math.round(entry.uv * 1.5));
+    return `${time}: ${bar ? `${bar} ` : ''}${entry.uv.toFixed(1)}`;
+  });
+  const chart = `Hourly UV Index Forecast:\n<pre>${chartLines.join('\n')}</pre>`;
+
+  // OpenUV's safe_exposure_time is computed at the UV level at request time
+  // (~07:00, near zero), not at the daily peak — so compute at uv_max ourselves.
+  // Same formula OpenUV uses: minutes = 200 × skinFactor / (3 × UV).
+  const skinFactors = [1, 1.2, 1.6, 2, 3.2, 6];
+  const atPeak = maxUV > 0
+    ? skinFactors.map(f => Math.round((200 * f) / (3 * maxUV)))
+    : skinFactors.map(() => null);
+  const exposureLines = [
+    `⏱️ <b>Max Sun Exposure (daily budget at peak UV):</b>`,
+    `  • Very fair skin: ${formatExposure(atPeak[0])}`,
+    `  • Fair skin: ${formatExposure(atPeak[1])}`,
+    `  • Light skin: ${formatExposure(atPeak[2])}`,
+    `  • Light brown skin: ${formatExposure(atPeak[3])}`,
+    `  • Brown skin: ${formatExposure(atPeak[4])}`,
+    `  • Dark brown/Black skin: ${formatExposure(atPeak[5])}`,
+  ];
+  if (atPeak[0] != null) {
+    exposureLines.push(
+      `\n🧴 Very fair skin with sunscreen <i>(reapply every 2 hr)</i>:`,
+      `  • SPF 30: ${formatExposure(atPeak[0] * 30)}`,
+      `  • SPF 50: ${formatExposure(atPeak[0] * 50)}`,
+    );
+  }
+
+  return [header, '', chart, '', exposureLines.join('\n')].join('\n');
+}
+
+// ─── Open-Meteo snapshot ────────────────────────────────────────────────────
+
+async function getOpenMeteoSnapshot(env: Env, coords: Coords): Promise<WeatherSnapshot | null> {
   const url = 'https://api.open-meteo.com/v1/forecast';
   const params = new URLSearchParams({
-    latitude: env.LATITUDE,
-    longitude: env.LONGITUDE,
-    hourly: 'precipitation_probability,precipitation',
+    latitude: coords.lat,
+    longitude: coords.lng,
+    hourly: 'precipitation_probability,precipitation,weathercode,windspeed_10m,windgusts_10m,temperature_2m,apparent_temperature',
     timezone: 'Europe/Amsterdam',
     forecast_days: '1',
   });
@@ -436,81 +649,60 @@ async function checkRainForecast(env: Env, forceTest = false, hourly?: GoogleHou
   const response = await fetch(`${url}?${params}`);
   const data = await response.json() as OpenMeteoResponse;
 
-  if (!data.hourly || !data.hourly.time) {
+  if (!data.hourly?.time) return null;
+
+  const amsterdamNow = new Date(new Date().toLocaleString('en-US', { timeZone: 'Europe/Amsterdam' }));
+  const currentHour = amsterdamNow.getHours();
+
+  for (let i = 0; i < data.hourly.time.length; i++) {
+    if (new Date(data.hourly.time[i]).getHours() === currentHour) {
+      return {
+        probability: data.hourly.precipitation_probability[i],
+        mm: data.hourly.precipitation[i],
+        weatherCode: data.hourly.weathercode[i],
+        windSpeedKmh: data.hourly.windspeed_10m[i],
+        windGustKmh: data.hourly.windgusts_10m[i],
+        tempC: data.hourly.temperature_2m[i],
+        feelsLikeC: data.hourly.apparent_temperature[i],
+      };
+    }
+  }
+  return null;
+}
+
+// ─── Rain check ──────────────────────────────────────────────────────────────
+
+async function checkRainForecast(env: Env, coords: Coords, forceTest = false, snapshot?: WeatherSnapshot): Promise<void> {
+  const s = snapshot ?? await getOpenMeteoSnapshot(env, coords);
+
+  if (!s) {
     if (forceTest) {
-      await sendTelegramMessage(`🌧️ *Rain Check Test*\n\nOpen-Meteo API returned unexpected response:\n\`\`\`\n${JSON.stringify(data, null, 2).slice(0, 500)}\n\`\`\``, env);
+      await sendTelegramMessage(`🌧️ <b>Rain Check Test</b>\n\nOpen-Meteo API returned no usable data for the current hour.`, env);
     }
     return;
   }
 
-  const now = new Date();
-  const amsterdamNow = new Date(now.toLocaleString('en-US', { timeZone: 'Europe/Amsterdam' }));
-  const currentHour = amsterdamNow.getHours();
-
-  // Look at the next 1 hour only
-  const upcomingRain: { time: string; probability: number; mm: number }[] = [];
-
-  for (let i = 0; i < data.hourly.time.length; i++) {
-    const forecastDate = new Date(data.hourly.time[i]);
-    const forecastHour = forecastDate.getHours();
-
-    if (forecastHour >= currentHour && forecastHour < currentHour + 1) {
-      const probability = data.hourly.precipitation_probability[i];
-      const mm = data.hourly.precipitation[i];
-
-      if (forceTest || probability >= 50 || mm > 0) {
-        upcomingRain.push({
-          time: forecastDate.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', timeZone: 'Europe/Amsterdam' }),
-          probability,
-          mm,
-        });
-      }
-    }
-  }
-
-  const rainDetected = upcomingRain.length > 0;
-  const [alertActive, googleHourly] = await Promise.all([
-    env.RAIN_STATE.get('rain_alert_active').then(v => v === 'true'),
-    hourly ?? getHourlyWeather(env),
-  ]);
-
-  const currentEntry = googleHourly.forecastHours.find(e => e.displayDateTime.hours === currentHour);
+  const rainDetected = forceTest || s.probability >= 50 || s.mm > 0;
+  const alertActive = (await env.RAIN_STATE.get('rain_alert_active')) === 'true';
 
   if (rainDetected && !alertActive) {
-    const maxProbability = Math.max(...upcomingRain.map(r => r.probability));
-
-    // Use Google precipitationType for the alert label if available
-    const rawPrecipType = currentEntry?.precipitation.qpf.precipitationType ?? 'NONE';
-    const { label: precipLabel, emoji: precipEmoji } = rawPrecipType !== 'NONE'
-      ? precipTypeLabel(rawPrecipType)
-      : precipTypeLabel('RAIN');
-
-    // Fall back to conditionMeta for the weather condition emoji/label
-    const condType = currentEntry?.weatherCondition.type ?? '';
-    const { emoji: condEmoji } = conditionMeta(condType);
-
+    const { precipLabel, precipEmoji, condEmoji } = wmoMeta(s.weatherCode);
     const caption = [
-      `${condEmoji} *Precipitation Alert for Amsterdam*\n`,
-      `${precipEmoji} ${precipLabel} expected in the next hour (up to ${maxProbability}% probability)\n`,
+      `${locationTag(coords)}${condEmoji} <b>Precipitation Alert for ${placeName(coords)}</b>\n`,
+      `${precipEmoji} ${precipLabel} expected in the next hour (up to <b>${s.probability}%</b> probability)\n`,
       `\n☂️ Don't forget your umbrella!`,
-      `\n[🗺️ View live radar map](https://www.rainviewer.com/map.html?loc=52.3676,4.9041,7)`,
+      `\n<a href="https://www.rainviewer.com/map.html?loc=${coords.lat},${coords.lng},7">🗺️ View live radar map</a>`,
     ].join('\n');
 
     await sendTelegramMessage(caption, env);
     await env.RAIN_STATE.put('rain_alert_active', 'true');
   } else if (!rainDetected && alertActive) {
-    let conditionsText = '';
-    if (currentEntry) {
-      const temp = Math.round(currentEntry.temperature.degrees);
-      const { label, emoji } = conditionMeta(currentEntry.weatherCondition.type);
-      conditionsText = `\nCurrent conditions: ${emoji} ${label}, ${temp}°C`;
-    }
-
-    const clearedMsg = `☀️ Looks like the rain has passed. No precipitation expected in the next hour.${conditionsText}`;
+    const { condLabel, condEmoji } = wmoMeta(s.weatherCode);
+    const clearedMsg = `☀️ Looks like the rain has passed. No precipitation expected in the next hour.\nCurrent conditions: ${condEmoji} ${condLabel}, <b>${Math.round(s.tempC)}°C</b>`;
     await sendTelegramMessage(clearedMsg, env);
     await env.RAIN_STATE.put('rain_alert_active', 'false');
   } else if (forceTest) {
-    await sendTelegramMessage(`🧪 *Rain Check Test*\n\nNo rain currently detected (or already alerted).\nKV state: rain_alert_active = ${alertActive}`, env);
+    await sendTelegramMessage(`🧪 <b>Rain Check Test</b>\n\nNo rain currently detected (or already alerted).\nKV state: rain_alert_active = ${alertActive}`, env);
   }
 }
 
@@ -535,8 +727,8 @@ function alertEmoji(eventType: string, severity: string): string {
   return '⚠️';
 }
 
-async function checkWeatherAlerts(env: Env): Promise<void> {
-  const alerts = await getWeatherAlerts(env);
+async function checkWeatherAlerts(env: Env, coords: Coords): Promise<void> {
+  const alerts = await getWeatherAlerts(env, coords);
 
   // Only care about Minor and above, filter out expired and future-only
   const active = alerts.filter(a => {
@@ -566,11 +758,11 @@ async function checkWeatherAlerts(env: Env): Promise<void> {
       : '';
 
     const lines = [
-      `${emoji} *${alert.alertTitle.text}*`,
-      `${severityLabel} warning · ${alert.areaName}${expiry ? ` · ${expiry}` : ''}`,
+      `${locationTag(coords)}${emoji} <b>${escapeHtml(alert.alertTitle.text)}</b>`,
+      `${severityLabel} warning · ${escapeHtml(alert.areaName)}${expiry ? ` · ${expiry}` : ''}`,
     ];
-    if (alert.description) lines.push(`\n${alert.description}`);
-    if (alert.instruction?.length) lines.push(`\n📋 ${alert.instruction[0]}`);
+    if (alert.description) lines.push(`\n${escapeHtml(alert.description)}`);
+    if (alert.instruction?.length) lines.push(`\n📋 ${escapeHtml(alert.instruction[0])}`);
 
     await sendTelegramMessage(lines.join('\n'), env);
   }
@@ -578,7 +770,7 @@ async function checkWeatherAlerts(env: Env): Promise<void> {
   // Send cleared messages for alerts that have dropped off
   for (const [id, title] of Object.entries(storedMap)) {
     if (id in activeMap) continue;
-    await sendTelegramMessage(`✅ *${title}* has expired or been lifted.`, env);
+    await sendTelegramMessage(`✅ <b>${escapeHtml(title)}</b> has expired or been lifted.`, env);
   }
 
   // Persist current active id → title map
@@ -589,25 +781,17 @@ async function checkWeatherAlerts(env: Env): Promise<void> {
 
 const WIND_ALERT_THRESHOLD_KMH = 50;
 
-async function checkWindAlert(env: Env, preloadedHourly?: GoogleHourlyResponse): Promise<void> {
-  const hourly = preloadedHourly ?? await getHourlyWeather(env);
-  const now = new Date();
-  const currentHour = parseInt(now.toLocaleString('en-US', { hour: 'numeric', hour12: false, timeZone: 'Europe/Amsterdam' }), 10);
+async function checkWindAlert(env: Env, coords: Coords, snapshot?: WeatherSnapshot): Promise<void> {
+  const s = snapshot ?? await getOpenMeteoSnapshot(env, coords);
+  if (!s) return;
 
-  // Look at the next hour
-  const upcoming = hourly.forecastHours.filter(e =>
-    e.displayDateTime.hours >= currentHour && e.displayDateTime.hours < currentHour + 1
-  );
-
-  const gusty = upcoming.filter(e => e.wind.gust.value >= WIND_ALERT_THRESHOLD_KMH);
-  const windDetected = gusty.length > 0;
+  const windDetected = s.windGustKmh >= WIND_ALERT_THRESHOLD_KMH;
   const alertActive = (await env.WIND_STATE.get('wind_alert_active')) === 'true';
 
   if (windDetected && !alertActive) {
-    const maxGust = Math.max(...gusty.map(e => e.wind.gust.value));
     const msg = [
-      `💨 *Wind Alert for Amsterdam*\n`,
-      `Gusts up to ${Math.round(maxGust)} km/h expected in the next hour.`,
+      `${locationTag(coords)}💨 <b>Wind Alert for ${placeName(coords)}</b>\n`,
+      `Gusts up to <b>${Math.round(s.windGustKmh)} km/h</b> expected in the next hour.`,
       `\n⚠️ Secure loose items and be cautious outdoors.`,
     ].join('\n');
     await sendTelegramMessage(msg, env);
@@ -618,17 +802,110 @@ async function checkWindAlert(env: Env, preloadedHourly?: GoogleHourlyResponse):
   }
 }
 
+// ─── Full report (morning cron + on-demand via Telegram) ────────────────────
+
+async function sendFullReport(env: Env, coords: Coords): Promise<void> {
+  const [dailyData, hourlyWeather, daysWeather, uvForecast] = await Promise.all([
+    getDailyUV(env, coords),
+    getHourlyWeather(env, coords),
+    getDaysWeather(env, coords, 2),
+    getUVForecast(env, coords),
+  ]);
+
+  const weatherBlock = buildWeatherBlock(
+    hourlyWeather,
+    daysWeather.forecastDays[0],
+    coords.custom ? null : computeSunDeltas(),
+  );
+
+  await sendTelegramMessage(locationTag(coords) + weatherBlock, env, true);
+  await sendTelegramMessage(buildUVBlock(dailyData, uvForecast), env, true);
+}
+
+// ─── Telegram webhook ────────────────────────────────────────────────────────
+
+interface TelegramUpdate {
+  message?: {
+    chat: { id: number };
+    text?: string;
+    location?: { latitude: number; longitude: number };
+  };
+}
+
+async function handleTelegramWebhook(request: Request, env: Env): Promise<Response> {
+  if (request.headers.get('X-Telegram-Bot-Api-Secret-Token') !== env.TELEGRAM_WEBHOOK_SECRET) {
+    return new Response('forbidden', { status: 403 });
+  }
+
+  // Alert state belongs to the previous location — reset on any location change
+  // so we don't send bogus "rain has passed" / "alert lifted" messages.
+  const clearAlertStates = () => Promise.all([
+    env.RAIN_STATE.put('rain_alert_active', 'false'),
+    env.WIND_STATE.put('wind_alert_active', 'false'),
+    env.ALERT_STATE.delete('active_alerts'),
+  ]);
+
+  const update = await request.json() as TelegramUpdate;
+  const msg = update.message;
+  // Always ack with 200 so Telegram doesn't retry.
+  if (!msg || String(msg.chat.id) !== env.CHAT_ID) return new Response('ok');
+
+  if (msg.location) {
+    const { latitude, longitude } = msg.location;
+    await env.ALERT_STATE.put(CUSTOM_LOCATION_KEY, JSON.stringify({ lat: latitude, lng: longitude }));
+    await clearAlertStates();
+    await sendFullReport(env, { lat: String(latitude), lng: String(longitude), custom: true });
+    return new Response('ok');
+  }
+
+  if (msg.text?.startsWith('🏠') || msg.text === '/reset') {
+    await env.ALERT_STATE.delete(CUSTOM_LOCATION_KEY);
+    await clearAlertStates();
+    await sendTelegramMessage('🏠 Location reset to Amsterdam.', env, true);
+    await sendFullReport(env, { lat: env.LATITUDE, lng: env.LONGITUDE, custom: false });
+    return new Response('ok');
+  }
+
+  // Any other text: send report for the active location.
+  await sendFullReport(env, await getActiveCoords(env));
+  return new Response('ok');
+}
+
+async function registerWebhook(request: Request, env: Env): Promise<Response> {
+  const workerUrl = new URL(request.url);
+  const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/setWebhook`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      url: `${workerUrl.origin}/telegram`,
+      secret_token: env.TELEGRAM_WEBHOOK_SECRET,
+      allowed_updates: ['message'],
+    }),
+  });
+  return new Response(await res.text());
+}
+
 // ─── Worker ──────────────────────────────────────────────────────────────────
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
+    if (url.pathname === '/telegram' && request.method === 'POST') {
+      return handleTelegramWebhook(request, env);
+    }
+    if (url.pathname === '/setup-webhook') {
+      return registerWebhook(request, env);
+    }
+    if (url.pathname === '/webhook-info') {
+      const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getWebhookInfo`);
+      return new Response(await res.text());
+    }
     if (url.pathname === '/test-rain') {
-      await checkRainForecast(env, true);
+      await checkRainForecast(env, await getActiveCoords(env), true);
       return new Response('Rain alert test sent to Telegram!');
     }
     if (url.pathname === '/test-wind') {
-      await checkWindAlert(env);
+      await checkWindAlert(env, await getActiveCoords(env));
       return new Response('Wind alert check triggered — check Telegram!');
     }
     if (url.pathname === '/test-morning') {
@@ -636,40 +913,29 @@ export default {
       return new Response('Morning report triggered — check Telegram!');
     }
     if (url.pathname === '/test-alerts') {
-      await checkWeatherAlerts(env);
+      await checkWeatherAlerts(env, await getActiveCoords(env));
       return new Response('Weather alerts check triggered — check Telegram!');
     }
     return new Response('Use /test-rain, /test-wind, /test-alerts, or /test-morning.');
   },
 
   async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
-    if (event.cron === '*/15 * * * *') {
-      const hourly = await getHourlyWeather(env);
-      await Promise.all([checkRainForecast(env, false, hourly), checkWindAlert(env, hourly), checkWeatherAlerts(env)]);
+    if (event.cron === '*/5 * * * *') {
+      const coords = await getActiveCoords(env);
+      const snapshot = await getOpenMeteoSnapshot(env, coords);
+      if (snapshot) {
+        await Promise.all([checkRainForecast(env, coords, false, snapshot), checkWindAlert(env, coords, snapshot)]);
+      }
       return;
     }
 
-    // Morning report — fetch all data in parallel
-    const [dailyData, hourlyWeather, daysWeather, uvForecast] = await Promise.all([
-      getDailyUV(env),
-      getHourlyWeather(env),
-      getDaysWeather(env, 2),
-      getUVForecast(env),
-    ]);
+    if (event.cron === '*/30 * * * *') {
+      await checkWeatherAlerts(env, await getActiveCoords(env));
+      return;
+    }
 
-    const sunDeltas = computeSunDeltas();
-
-    const weatherBlock = buildWeatherBlock(
-      hourlyWeather,
-      daysWeather.forecastDays[0],
-      sunDeltas,
-      dailyData,
-      uvForecast,
-    );
-
-    const message = weatherBlock;
-
-    await sendTelegramMessage(message, env);
+    // Morning report — uses custom location if one is set
+    await sendFullReport(env, await getActiveCoords(env));
   },
 };
 
