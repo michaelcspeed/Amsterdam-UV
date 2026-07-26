@@ -419,17 +419,21 @@ function windDescriptor(speedKmh: number): string {
 // ─── Clothing recommendation ─────────────────────────────────────────────────
 
 const RAIN_PROB_THRESHOLD = 40;
+// Rain you'd actually feel. A 35%-chance day carrying 0.7mm still wants a jacket,
+// which a probability-only test misses.
+const RAIN_JACKET_MM_THRESHOLD = 0.2;
 const WINDY_GUST_THRESHOLD = 40;
 const VERY_WINDY_GUST_THRESHOLD = 60;
 
 function clothingHeadline(
   feelsLikeMinDaylight: number,
   rainProb: number,
+  totalMm: number,
   gustKmh: number,
   tempMin: number,
   tempMax: number,
 ): string {
-  const wet = rainProb >= RAIN_PROB_THRESHOLD;
+  const wet = rainProb >= RAIN_PROB_THRESHOLD || totalMm >= RAIN_JACKET_MM_THRESHOLD;
   const windy = gustKmh >= WINDY_GUST_THRESHOLD;
   const veryWindy = gustKmh >= VERY_WINDY_GUST_THRESHOLD;
 
@@ -465,18 +469,25 @@ interface RainHour {
   prob: number;
 }
 
-// The hourly endpoint returns a rolling 24h, so cut at the midnight wrap to get
-// "the rest of today". Late-evening on-demand reports would be left with a one-
-// or two-row chart, so fall back to a flat next-6-hours window.
-function todaysRainHours(hourly: GoogleHourlyResponse): RainHour[] {
-  const all: RainHour[] = hourly.forecastHours.map(entry => ({
+// The hourly endpoint returns a rolling 24h window, so cut at the midnight wrap to
+// get "the rest of today". Without this the overnight low, the peak-chance hour and
+// the rain chart all silently bleed into tomorrow. Late-evening on-demand reports
+// would be left with one or two rows, so fall back to a flat next-6-hours window.
+function todaysHours(hourly: GoogleHourlyResponse): GoogleHourEntry[] {
+  const all = hourly.forecastHours;
+  const wrap = all.findIndex(
+    (entry, i) => i > 0 && entry.displayDateTime.hours < all[i - 1].displayDateTime.hours,
+  );
+  const today = wrap === -1 ? all : all.slice(0, wrap);
+  return today.length >= 6 ? today : all.slice(0, 6);
+}
+
+function rainHours(hours: GoogleHourEntry[]): RainHour[] {
+  return hours.map(entry => ({
     hour: entry.displayDateTime.hours,
     mm: entry.precipitation.qpf.quantity,
     prob: entry.precipitation.probability.percent,
   }));
-  const wrap = all.findIndex((row, i) => i > 0 && row.hour < all[i - 1].hour);
-  const today = wrap === -1 ? all : all.slice(0, wrap);
-  return today.length >= 6 ? today : all.slice(0, 6);
 }
 
 // brolly.sh-style hourly rainfall chart, collapsed behind an expandable blockquote.
@@ -506,21 +517,25 @@ function buildWeatherBlock(
   today: GoogleDayEntry,
   sunDeltas: { sunrise: number; sunset: number } | null,
 ): string {
+  // Every reading below comes from this one window, so the temperature range, the
+  // peak-chance hour and the chart can't disagree about which day they describe.
+  const todayHours = todaysHours(hourly);
+
   // Rain: peak probability across daylight hours
   let maxRainProb = 0;
   let maxRainHour = -1;
-  for (const entry of hourly.forecastHours) {
+  for (const entry of todayHours) {
     const h = entry.displayDateTime.hours;
     if (h < 6 || h > 22) continue;
     const prob = entry.precipitation.probability.percent;
     if (prob > maxRainProb) { maxRainProb = prob; maxRainHour = h; }
   }
-  const rainRows = todaysRainHours(hourly);
+  const rainRows = rainHours(todayHours);
   const rainChart = buildRainChart(rainRows);
+  const totalMm = rainRows.reduce((sum, r) => sum + r.mm, 0);
 
   let rainLine: string;
   if (rainChart) {
-    const totalMm = rainRows.reduce((sum, r) => sum + r.mm, 0);
     const heaviest = rainRows.reduce((a, b) => (b.mm > a.mm ? b : a));
     rainLine = `🌧️ up to <b>${maxRainProb}%</b> chance · <b>${totalMm.toFixed(1)}mm</b> <i>(heaviest ${String(heaviest.hour).padStart(2, '0')}:00)</i>`;
   } else if (maxRainProb >= 20) {
@@ -529,29 +544,31 @@ function buildWeatherBlock(
     rainLine = `🌂 <i>no rain expected</i>`;
   }
 
-  // Temp — actual min/max from hourly + daylight feels-like min for clothing
+  // Temp — actual and feels-like both over today's remaining hours, plus the
+  // daylight feels-like min that drives the clothing call.
   let minTemp = Infinity, maxTemp = -Infinity, minHour = 0, maxHour = 0;
+  let feelsLow = Infinity, feelsHigh = -Infinity;
   let feelsLikeMinDaylight = Infinity;
-  for (const entry of hourly.forecastHours) {
+  for (const entry of todayHours) {
     const h = entry.displayDateTime.hours;
     const t = entry.temperature.degrees;
+    const f = entry.feelsLikeTemperature.degrees;
     if (t < minTemp) { minTemp = t; minHour = h; }
     if (t > maxTemp) { maxTemp = t; maxHour = h; }
-    if (h >= 7 && h <= 22) {
-      const f = entry.feelsLikeTemperature.degrees;
-      if (f < feelsLikeMinDaylight) feelsLikeMinDaylight = f;
-    }
+    if (f < feelsLow) feelsLow = f;
+    if (f > feelsHigh) feelsHigh = f;
+    if (h >= 7 && h <= 22 && f < feelsLikeMinDaylight) feelsLikeMinDaylight = f;
   }
-  const feelsHigh = Math.round(today.feelsLikeMaxTemperature.degrees);
-  const feelsLow = Math.round(today.feelsLikeMinTemperature.degrees);
-  const tempLine = `🌡️ <b>${Math.round(minTemp)}°</b> (${String(minHour).padStart(2, '0')}:00) → <b>${Math.round(maxTemp)}°</b> (${String(maxHour).padStart(2, '0')}:00), <i>feels ${feelsLow}–${feelsHigh}°</i>`;
+  const tempLine = `🌡️ <b>${Math.round(minTemp)}°</b> (${String(minHour).padStart(2, '0')}:00) → <b>${Math.round(maxTemp)}°</b> (${String(maxHour).padStart(2, '0')}:00), <i>feels ${Math.round(feelsLow)}–${Math.round(feelsHigh)}°</i>`;
 
   // Wind
   const wind = today.daytimeForecast.wind;
   const gustKmh = Math.round(wind.gust.value);
   const windLine = `💨 <b>${windDescriptor(Math.round(wind.speed.value))}</b>${gustKmh >= 40 ? ` <i>· gusts ${gustKmh} km/h</i>` : ''}`;
 
-  const headline = clothingHeadline(feelsLikeMinDaylight, maxRainProb, gustKmh, minTemp, maxTemp);
+  // A late-evening report can hold no daylight hours at all; dress for what's left.
+  const dressFor = feelsLikeMinDaylight === Infinity ? feelsLow : feelsLikeMinDaylight;
+  const headline = clothingHeadline(dressFor, maxRainProb, totalMm, gustKmh, minTemp, maxTemp);
 
   const lines = [
     `<b>${headline}</b>`,
@@ -605,7 +622,9 @@ function buildUVBlock(dailyUV: DailyUV, uvForecast: UVForecastEntry[]): string {
     const bar = '█'.repeat(Math.round(entry.uv * 1.5));
     return `${time}: ${bar ? `${bar} ` : ''}${entry.uv.toFixed(1)}`;
   });
-  const chart = `Hourly UV Index Forecast:\n<pre>${chartLines.join('\n')}</pre>`;
+  // Collapsed: keeps ~25 lines out of the way, and a <pre> nested in a blockquote
+  // loses the "copy code" button Telegram bolts onto standalone code blocks.
+  const chart = `Hourly UV Index Forecast:\n<blockquote expandable><pre>${chartLines.join('\n')}</pre></blockquote>`;
 
   // OpenUV's safe_exposure_time is computed at the UV level at request time
   // (~07:00, near zero), not at the daily peak — so compute at uv_max ourselves.
@@ -615,7 +634,6 @@ function buildUVBlock(dailyUV: DailyUV, uvForecast: UVForecastEntry[]): string {
     ? skinFactors.map(f => Math.round((200 * f) / (3 * maxUV)))
     : skinFactors.map(() => null);
   const exposureLines = [
-    `⏱️ <b>Max Sun Exposure (daily budget at peak UV):</b>`,
     `  • Very fair skin: ${formatExposure(atPeak[0])}`,
     `  • Fair skin: ${formatExposure(atPeak[1])}`,
     `  • Light skin: ${formatExposure(atPeak[2])}`,
@@ -631,7 +649,12 @@ function buildUVBlock(dailyUV: DailyUV, uvForecast: UVForecastEntry[]): string {
     );
   }
 
-  return [header, '', chart, '', exposureLines.join('\n')].join('\n');
+  const exposure = [
+    `⏱️ <b>Max Sun Exposure (daily budget at peak UV):</b>`,
+    `<blockquote expandable>${exposureLines.join('\n')}</blockquote>`,
+  ].join('\n');
+
+  return [header, '', chart, '', exposure].join('\n');
 }
 
 // ─── Open-Meteo snapshot ────────────────────────────────────────────────────
